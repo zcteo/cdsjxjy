@@ -235,6 +235,19 @@
         };
     }
 
+    // play 之前先调用一次 login 上报（返回 204 无内容），参数同 play 但无 result
+    function callLogin(c) {
+        const url =
+            'https://report.csslcloud.net/report/replay/login?userid=' +
+            encodeURIComponent(c.accountId) +
+            '&roomid=' + encodeURIComponent(c.roomid) +
+            '&viewerid=' + encodeURIComponent(c.viewerid) +
+            '&upid=' + encodeURIComponent(c.upid) +
+            '&terminal=0&ua=1&recordid=' + encodeURIComponent(c.recordid) +
+            '&time=' + Date.now();
+        return gmRequest({ url });
+    }
+
     function callPlay(c) {
         const url =
             'https://report.csslcloud.net/report/replay/play?userid=' +
@@ -341,7 +354,7 @@
         statusEl = panel.querySelector('#ph_status');
 
         panel.querySelector('#ph_close').onclick = () => {
-            closedHash = location.hash;
+            panelClosedHash = location.hash;
             panel.style.display = 'none';
         };
         panel.querySelector('#ph_start').onclick = onStart;
@@ -354,7 +367,8 @@
 
     const TARGET_HASH = '#/offlineTraining/courseReplay';
     const SURVEY_HASH = '#/offlineTraining/viewingRecords';
-    let closedHash = null; // 用户手动关闭时的 hash；同一 hash 下不再自动出现
+    let panelClosedHash = null;  // 主面板手动关闭时的 hash；同一 hash 下不再自动出现
+    let surveyClosedHash = null; // 问卷面板手动关闭时的 hash；同一 hash 下不再自动出现
     let surveyPanel = null;   // 一键完成问卷面板
     let surveyTbody = null;   // 问卷表格 tbody
     let surveyStatusEl = null; // 问卷状态栏
@@ -394,7 +408,7 @@
         surveyStatusEl = surveyPanel.querySelector('#ph_q_status');
 
         surveyPanel.querySelector('#ph_q_close').onclick = () => {
-            closedHash = location.hash;
+            surveyClosedHash = location.hash;
             surveyPanel.style.display = 'none';
         };
         surveyPanel.querySelector('#ph_q_query').onclick = querySurveys;
@@ -528,10 +542,11 @@
         if (!surveyPanel) return;
         const match = location.hash.indexOf(SURVEY_HASH) === 0;
         if (match) {
-            if (location.hash === closedHash) return; // 已在此路由手动关闭，保持隐藏
+            if (location.hash === surveyClosedHash) return; // 已在此路由手动关闭，保持隐藏
             if (!document.body.contains(surveyPanel)) document.body.appendChild(surveyPanel);
             surveyPanel.style.display = '';
         } else {
+            surveyClosedHash = null; // 离开该路由，重置关闭标记
             surveyPanel.style.display = 'none';
         }
     }
@@ -541,12 +556,12 @@
         if (!panel) return;
         const match = location.hash.indexOf(TARGET_HASH) === 0;
         if (match) {
-            if (location.hash === closedHash) return; // 已在此路由手动关闭，保持隐藏
+            if (location.hash === panelClosedHash) return; // 已在此路由手动关闭，保持隐藏
             // SPA 切换路由可能把面板从 DOM 移除，这里确保重新挂载
             if (!document.body.contains(panel)) document.body.appendChild(panel);
             panel.style.display = '';
         } else {
-            closedHash = null; // 离开该路由，重置关闭标记
+            panelClosedHash = null; // 离开该路由，重置关闭标记
             panel.style.display = 'none';
         }
     }
@@ -829,6 +844,8 @@
         if (!c.viewerid) c.viewerid = meta.viewerid;
         log('meta 完成:', c.className, 'upid=', c.upid);
 
+        await callLogin(c);
+        log('login 上报已调用:', c.className);
         await callPlay(c);
         c.playStartTs = Date.now();
         log('play 已调用:', c.className);
@@ -878,3 +895,7 @@
     if (document.body) init();
     else window.addEventListener('DOMContentLoaded', init);
 })();
+
+// 方案2，直接浏览器打开 GetRecordUrl 返回的地址
+// btn = document.getElementById("cc_player_play_btn")
+// btn.click()
