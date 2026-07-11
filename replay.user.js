@@ -1,14 +1,15 @@
 // ==UserScript==
 // @name         成都市中小学教师继续教育网-线下培训助手
 // @namespace    https://www.cdsjxjy.cn/
-// @version      1.0.0
+// @version      1.1.0
 // @description  课程自动回放，观看记录页面自动完成问卷
 // @author       zcteo.cn@gmail.com
 // @match        https://www.cdsjxjy.cn/*
+// @match        https://view.csslcloud.net/*
 // @grant        GM_xmlhttpRequest
+// @grant        GM_setValue
+// @grant        GM_getValue
 // @connect      www.cdsjxjy.cn
-// @connect      view.csslcloud.net
-// @connect      report.csslcloud.net
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -16,17 +17,16 @@
 // 仅供学习使用，作者不对该脚本产生的任何行为负责，严谨倒卖！！！
 // 尊重作者权益，请勿在未经允许的情况下擅自修改代码和发布到其他平台！
 // 仅支持 ad1a2087-a431-422f-a6cc-e28a8cb0dde8 问卷！
-// 更新日期：2026-07-08
+// 更新日期：2026-07-11
 // ****************************************************************************************
 
-(function () {
-    'use strict';
-
-    const COURSE_LEVEL_ID = '7CE980E9-FDC1-45DC-9033-D9D12E7EA432'; // 全学段
-    const HEARTBEAT_INTERVAL = 10000; // 10s
-    const KEEPALIVE_INTERVAL = 600000; // 10min，定时请求列表接口防止 token 失效
-    const DEVICE_VERSION = '3.22.3';
-    const LOGIN_DEVICE_VERSION = '1.0.0';
+; (function () {
+    'use strict'
+    const LOG = '[线下培训]'
+    const COURSE_LEVEL_ID = '7CE980E9-FDC1-45DC-9033-D9D12E7EA432' // 全学段
+    const RENDER_INTERVAL = 2000 // 主面板刷新 + 窗口监控
+    const KEEPALIVE_INTERVAL = 600000 // 10min，定时请求列表接口防止 token 失效
+    const WORKER_PROBE_INTERVAL = 2000 // 播放窗口探测播放按钮（兼计时步长）
 
     // 问卷答案库：key 为 queId，value 为固定的 recordList（提交时仅 projectId 改为对应 classId）
     // 新增其他问卷时，按同样结构追加一条即可
@@ -48,10 +48,7 @@
         ],
     };
 
-    const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
-    const log = (...a) => console.log('[线下培训]', ...a);
-
-    // ---------- 请求封装 ----------
+    // ---------- 通用 ----------
     function gmRequest(opts) {
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
@@ -64,63 +61,163 @@
                 onload: (r) => resolve(r),
                 onerror: (e) => reject(e),
                 ontimeout: () => reject(new Error('timeout: ' + opts.url)),
-            });
-        });
+            })
+        })
     }
 
     // 本域接口鉴权：token 存于 localStorage.cdctetorage，header 名为 Token
     // 结构形如 {"user":{"session":{...,"token":"xxx"},"token":"xxx"}}
     function getToken() {
         try {
-            const raw = localStorage.getItem('cdctetorage');
-            if (!raw) return '';
-            const obj = JSON.parse(raw);
+            const raw = localStorage.getItem('cdctetorage')
+            if (!raw) return ''
+            const obj = JSON.parse(raw)
             return (
                 (obj && obj.token) ||
                 (obj && obj.user && obj.user.token) ||
                 (obj && obj.user && obj.user.session && obj.user.session.token) ||
                 (obj && obj.session && obj.session.token) ||
                 ''
-            );
+            )
         } catch (e) {
-            return '';
+            return ''
         }
     }
 
     function siteHeaders(json) {
-        const h = {};
-        if (json) h['Content-Type'] = 'application/json';
-        const t = getToken();
-        if (t) h['Token'] = t;
-        return h;
-    }
-
-    // 从 GetRecordUrl 一次性解析 accountId(userid) 及登录用的 viewername/viewertoken
-    async function fetchRecordUrl(recordid) {
-        const r = await gmRequest({
-            url: 'https://www.cdsjxjy.cn/prod/offlineLiveRecord/GetRecordUrl?recordid=' + encodeURIComponent(recordid),
-            headers: siteHeaders(false),
-            responseType: 'json',
-        });
-        const json = readJson(r);
-        if (json.code !== 200 || !json.data) throw new Error('GetRecordUrl 返回: ' + json.msg);
-        const q = new URL(json.data).searchParams;
-        return {
-            accountId: q.get('userid') || '',
-            viewername: q.get('viewername') || '',
-            viewertoken: q.get('viewertoken') || '',
-        };
+        const h = {}
+        if (json) h['Content-Type'] = 'application/json'
+        const t = getToken()
+        if (t) h['Token'] = t
+        return h
     }
 
     // 兼容不同油猴管理器：body 可能在 responseText，也可能在 response(字符串或对象)
     function readJson(r) {
-        if (r && r.response && typeof r.response === 'object') return r.response;
-        const txt =
-            (r && r.responseText) ||
-            (r && typeof r.response === 'string' ? r.response : '');
-        if (!txt) throw new Error('空响应 (status ' + (r && r.status) + ')');
-        return JSON.parse(txt);
+        if (r && r.response && typeof r.response === 'object') return r.response
+        const txt = (r && r.responseText) || (r && typeof r.response === 'string' ? r.response : '')
+        if (!txt) throw new Error('空响应 (status ' + (r && r.status) + ')')
+        return JSON.parse(txt)
     }
+
+    function escapeHtml(s) {
+        return String(s).replace(/[&<>"]/g, (m) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[m])
+    }
+
+    // ---------- 本地进度（GM 跨域共享）----------
+    // progress[classId] = { className, recordid, watchedSec, targetSec, date }
+    const PROGRESS_KEY = 'cdsjxjy_progress'
+
+    function getProgress() {
+        return GM_getValue(PROGRESS_KEY, {}) || {}
+    }
+    function saveProgress(p) {
+        GM_setValue(PROGRESS_KEY, p)
+    }
+    function todayStr() {
+        const d = new Date()
+        return (
+            d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0')
+        )
+    }
+    // 按 recordid 反查 classId（播放窗口只知 recordid）
+    function findClassIdByRecordid(progress, recordid) {
+        for (const k in progress) {
+            if (progress[k] && progress[k].recordid === recordid) return k
+        }
+        return null
+    }
+
+    // ==================================================================
+    // 播放窗口 worker：仅在 view.csslcloud.net 生效
+    // 职责：每 WORKER_PROBE_INTERVAL 探测播放按钮；可见就点击，隐藏(正在播)则累加 watchedSec
+    // 规则：进度里找不到对应 recordid → 不接管；当日已刷满 → 不接管
+    // ==================================================================
+    function runWorker() {
+        function getUrlParam(name) {
+            const r = new RegExp('(?:^|&)' + name + '=([^&]*)', 'i').exec(location.search.substr(1))
+            return r ? decodeURIComponent(r[1]).split('?')[0] : ''
+        }
+        const recordid = getUrlParam('recordid')
+        if (!recordid) return
+
+        const RELOAD_GRACE = 3000 // 页面加载后给 SDK 自检时间，避免打断初始化
+        const loadTs = Date.now()
+        let probeTimer = null
+
+        function readEntry() {
+            const p = getProgress()
+            const cid = findClassIdByRecordid(p, recordid)
+            if (!cid) return null
+            return { classId: cid, data: p[cid] }
+        }
+
+        function stopAll() {
+            if (probeTimer) {
+                clearInterval(probeTimer)
+                probeTimer = null
+            }
+        }
+
+        function playBtn() {
+            return document.getElementsByClassName('iconfont iconbofang')[0] || null
+        }
+        function btnVisible(el) {
+            return !!el && window.getComputedStyle(el).display !== 'none'
+        }
+        function nowStr() {
+            const d = new Date()
+            const p2 = (n) => String(n).padStart(2, '0')
+            return p2(d.getHours()) + ':' + p2(d.getMinutes()) + ':' + p2(d.getSeconds())
+        }
+
+        // 每 WORKER_PROBE_INTERVAL：拿不到按钮且超宽限期 → 刷新重试；
+        // 按钮可见 → 点击；按钮已隐藏(正在播) → 累加 watchedSec。
+        probeTimer = setInterval(() => {
+            const e = readEntry()
+            if (!e) return // 不是本工具排进度的课，不打扰
+            if (e.data.watchedSec >= e.data.targetSec) {
+                stopAll()
+                return
+            } // 已刷满
+            const el = playBtn()
+            if (!el) {
+                // 按钮未渲染：宽限期内等 SDK 初始化，超过则判定登录失败、刷新重试
+                console.log(LOG, nowStr(), '按钮未渲染, 等待SDK:', e.data.className)
+                if (Date.now() - loadTs > RELOAD_GRACE) {
+                    console.log(LOG, nowStr(), '超宽限期仍未渲染, 刷新页面:', e.data.className)
+                    location.reload()
+                }
+                return
+            }
+            if (btnVisible(el)) {
+                el.click()
+                console.log(LOG, nowStr(), '点击播放(按钮可见):', e.data.className)
+            } else {
+                // 按钮已隐藏 = 正在播放，累加 watchedSec（与探测同频）
+                const p = getProgress()
+                const d = p[e.classId]
+                if (d && d.watchedSec < d.targetSec) {
+                    d.watchedSec = (d.watchedSec || 0) + WORKER_PROBE_INTERVAL / 1000
+                    d.date = todayStr()
+                    p[e.classId] = d
+                    saveProgress(p)
+                }
+                // 已刷满
+                if (d && d.watchedSec >= d.targetSec) {
+                    stopAll()
+                    return
+                }
+            }
+            // 按钮仍可见会在下个 tick 继续点击，直到播放成功按钮隐藏
+        }, WORKER_PROBE_INTERVAL)
+
+        console.log(LOG, 'worker 已加载, recordid=' + recordid)
+    }
+
+    // ==================================================================
+    // 主站控制台：仅在 www.cdsjxjy.cn 生效
+    // ==================================================================
 
     // ---------- 接口 ----------
     async function fetchPlaybackList(pageNum, pageSize) {
@@ -133,17 +230,17 @@
             className: '',
             date: '',
             courseType: '',
-        };
+        }
         const r = await gmRequest({
             method: 'POST',
             url: 'https://www.cdsjxjy.cn/prod/offlinecourse/class/page/playback',
             headers: siteHeaders(true),
             data: JSON.stringify(body),
             responseType: 'json',
-        });
-        const json = readJson(r);
-        if (json.code !== 200) throw new Error('列表接口返回: ' + json.msg);
-        return (json.data && json.data.content) || [];
+        })
+        const json = readJson(r)
+        if (json.code !== 200) throw new Error('列表接口返回: ' + json.msg)
+        return (json.data && json.data.content) || []
     }
 
     async function fetchStudentFirst(classId) {
@@ -151,125 +248,44 @@
             url: 'https://www.cdsjxjy.cn/prod/offlineLiveRecord/studentlist?id=' + encodeURIComponent(classId),
             headers: siteHeaders(false),
             responseType: 'json',
-        });
-        const json = readJson(r);
-        if (json.code !== 200) throw new Error('studentlist 返回: ' + json.msg);
-        const arr = json.data || [];
-        return arr.length ? arr[0] : null;
+        })
+        const json = readJson(r)
+        if (json.code !== 200) throw new Error('studentlist 返回: ' + json.msg)
+        const arr = json.data || []
+        return arr.length ? arr[0] : null
     }
 
     // 完成判定：isnormal===1；或 isnormal!==1 时 watchtime > liveTimeLimit（两者可能为 null）
     function isCompleted(status) {
-        if (status.isnormal === 1) return true;
-        const wt = status.watchtime;
-        const lt = status.liveTimeLimit;
-        if (wt != null && lt != null && Number(wt) > Number(lt)) return true;
-        return false;
+        if (status.isnormal === 1) return true
+        const wt = status.watchtime
+        const lt = status.liveTimeLimit
+        if (wt != null && lt != null && Number(wt) > Number(lt)) return true
+        return false
     }
 
-    // 查询回放学习状态：isnormal===1 表示已完成；否则用 liveTimeLimit/watchtime 算目标时长
     async function checkStatus(classId) {
         const r = await gmRequest({
-            url: 'https://www.cdsjxjy.cn/prod/offlineLiveUserAction/checkPlaybackStatus?classId=' + encodeURIComponent(classId),
+            url:
+                'https://www.cdsjxjy.cn/prod/offlineLiveUserAction/checkPlaybackStatus?classId=' + encodeURIComponent(classId),
             headers: siteHeaders(false),
             responseType: 'json',
-        });
-        const json = readJson(r);
-        if (json.code !== 200) throw new Error('checkPlaybackStatus 返回: ' + json.msg);
-        return json.data || {};
+        })
+        const json = readJson(r)
+        if (json.code !== 200) throw new Error('checkPlaybackStatus 返回: ' + json.msg)
+        return json.data || {}
     }
 
-    // 回放登录，拿 token/viewerid/roomid；前几次可能 success:false，每 1s 重试到成功
-    async function loginReplay(accountId, replayId, userName, userToken, onRetry) {
-        const body = {
-            accountId: accountId,
-            replayId: replayId,
-            deviceType: 'h5-pc',
-            deviceVersion: LOGIN_DEVICE_VERSION,
-            tpl: '20',
-            userName: userName,
-            userToken: userToken,
-        };
-        let attempt = 0;
-        for (; ;) {
-            if (stopped) throw new Error('已停止');
-            attempt++;
-            let json = null;
-            try {
-                const r = await gmRequest({
-                    method: 'POST',
-                    url: 'https://view.csslcloud.net/replay/user/login',
-                    headers: { 'Content-Type': 'application/json' },
-                    data: JSON.stringify(body),
-                    responseType: 'json',
-                });
-                json = readJson(r);
-            } catch (e) {
-                json = null;
-            }
-            if (json && json.success && json.data && json.data.user) {
-                return json.data.user; // {id, name, token, roomId, replayId, accountId, tpl}
-            }
-            if (onRetry) onRetry(attempt);
-            await sleep(1000);
-        }
-    }
-
-    async function fetchMeta(accountId, replayId, token) {
-        const url =
-            'https://view.csslcloud.net/replay/data/meta?accountId=' +
-            encodeURIComponent(accountId) +
-            '&replayId=' +
-            encodeURIComponent(replayId) +
-            '&deviceType=h5-pc&deviceVersion=' +
-            DEVICE_VERSION +
-            '&terminal=3&tpl=20';
-        const headers = {};
-        if (token) headers['X-HD-Token'] = token;
-        const r = await gmRequest({ url, headers, responseType: 'json' });
-        const json = readJson(r);
-        if (!json.success) throw new Error('meta 接口失败');
-        return {
-            viewerid: json.data.user.id,
-            upid: json.data.upId,
-        };
-    }
-
-    // play 之前先调用一次 login 上报（返回 204 无内容），参数同 play 但无 result
-    function callLogin(c) {
-        const url =
-            'https://report.csslcloud.net/report/replay/login?userid=' +
-            encodeURIComponent(c.accountId) +
-            '&roomid=' + encodeURIComponent(c.roomid) +
-            '&viewerid=' + encodeURIComponent(c.viewerid) +
-            '&upid=' + encodeURIComponent(c.upid) +
-            '&terminal=0&ua=1&recordid=' + encodeURIComponent(c.recordid) +
-            '&time=' + Date.now();
-        return gmRequest({ url });
-    }
-
-    function callPlay(c) {
-        const url =
-            'https://report.csslcloud.net/report/replay/play?userid=' +
-            encodeURIComponent(c.accountId) +
-            '&roomid=' + encodeURIComponent(c.roomid) +
-            '&viewerid=' + encodeURIComponent(c.viewerid) +
-            '&upid=' + encodeURIComponent(c.upid) +
-            '&terminal=0&ua=1&recordid=' + encodeURIComponent(c.recordid) +
-            '&time=' + Date.now() + '&result=0';
-        return gmRequest({ url });
-    }
-
-    function callHeartbeat(c) {
-        const url =
-            'https://report.csslcloud.net/report/replay/heartbeat?userid=' +
-            encodeURIComponent(c.accountId) +
-            '&roomid=' + encodeURIComponent(c.roomid) +
-            '&viewerid=' + encodeURIComponent(c.viewerid) +
-            '&upid=' + encodeURIComponent(c.upid) +
-            '&terminal=0&ua=1&recordid=' + encodeURIComponent(c.recordid) +
-            '&time=' + Date.now() + '&result=0&vdrop=-1&avgbytes=-1&block=1';
-        return gmRequest({ url });
+    // 取真实回放 URL（直接 window.open 它，等同手动打开播放窗口）
+    async function fetchRecordUrl(recordid) {
+        const r = await gmRequest({
+            url: 'https://www.cdsjxjy.cn/prod/offlineLiveRecord/GetRecordUrl?recordid=' + encodeURIComponent(recordid),
+            headers: siteHeaders(false),
+            responseType: 'json',
+        })
+        const json = readJson(r)
+        if (json.code !== 200 || !json.data) throw new Error('GetRecordUrl 返回: ' + json.msg)
+        return json.data
     }
 
     // ---------- 问卷 ----------
@@ -281,17 +297,17 @@
             pageSize: Number(pageSize),
             isnormal: '0',
             isvote: '0',
-        };
+        }
         const r = await gmRequest({
             method: 'POST',
             url: 'https://www.cdsjxjy.cn/prod/offlineLiveUserAction/mypage',
             headers: siteHeaders(true),
             data: JSON.stringify(body),
             responseType: 'json',
-        });
-        const json = readJson(r);
-        if (json.code !== 200) throw new Error('mypage 返回: ' + json.msg);
-        return (json.data && json.data.content) || [];
+        })
+        const json = readJson(r)
+        if (json.code !== 200) throw new Error('mypage 返回: ' + json.msg)
+        return (json.data && json.data.content) || []
     }
 
     // 提交一份问卷答案（projectId 用课程 classId）
@@ -300,89 +316,88 @@
             projectId: classId,
             queId: queId,
             recordList: QUESTIONNAIRE_ANSWERS[queId],
-        };
+        }
         const r = await gmRequest({
             method: 'POST',
             url: 'https://www.cdsjxjy.cn/prod/questionnaireRecord/BatchRecord',
             headers: siteHeaders(true),
             data: JSON.stringify(body),
             responseType: 'json',
-        });
-        const json = readJson(r);
-        if (json.code !== 200) throw new Error('BatchRecord 返回: ' + json.msg);
-        return json.data;
+        })
+        const json = readJson(r)
+        if (json.code !== 200) throw new Error('BatchRecord 返回: ' + json.msg)
+        return json.data
     }
 
-    // 一键完成问卷的实现见下方 UI 部分（buildSurveyPanel / querySurveys / doOneSurvey / onFillAll）
-
     // ---------- UI ----------
-    let panel, tbody, statusEl;
-    const courses = []; // 运行中的课程
+    let panel, tbody, statusEl
+    const courses = [] // 显示用：{classId, className, status, watchedSec, targetSec, recordid, url, error, note}
+    const queue = [] // 待开窗课程
+    const active = [] // {win, classId, openTs}
 
     function buildUI() {
-        panel = document.createElement('div');
+        panel = document.createElement('div')
         panel.style.cssText =
             'position:fixed;top:12px;right:12px;z-index:999999;width:520px;max-height:80vh;' +
             'overflow:auto;background:#fff;border:1px solid #ccc;border-radius:8px;' +
             'box-shadow:0 4px 16px rgba(0,0,0,.2);font-size:13px;color:#333;' +
-            'font-family:Arial,Microsoft YaHei,sans-serif;';
+            'font-family:Arial,Microsoft YaHei,sans-serif;'
 
         panel.innerHTML =
             '<div style="padding:8px 10px;background:#1677ff;color:#fff;border-radius:8px 8px 0 0;' +
             'display:flex;justify-content:space-between;align-items:center;cursor:move" id="ph_head">' +
-            '<b>课程回放；自动回放过程中请勿刷新页面</b><span id="ph_close" style="cursor:pointer">✕</span></div>' +
+            '<b>课程回放；刷课过程中请勿刷新页面，并允许本站弹窗</b><span id="ph_close" style="cursor:pointer">✕</span></div>' +
             '<div style="padding:10px">' +
             '<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:8px">' +
-            'pageNum <input id="ph_pn" type="number" value="1" style="width:55px" />' +
-            'pageSize <input id="ph_ps" type="number" value="10" style="width:55px" />' +
-            '总页数 <input id="ph_tp" type="number" value="1" min="1" style="width:55px" />' +
+            '刷课门数 <input id="ph_count" type="number" value="10" min="1" style="width:60px" />' +
+            '同时窗口数 <input id="ph_conc" type="number" value="1" min="1" style="width:55px" />' +
             '<button id="ph_start" style="cursor:pointer">开始</button>' +
             '<button id="ph_stop" style="cursor:pointer" disabled>停止</button>' +
-            '<button id="ph_clear" style="cursor:pointer" disabled>清除</button>' +
+            '<button id="ph_clear" style="cursor:pointer">清除进度</button>' +
             '</div>' +
             '<div id="ph_status" style="margin-bottom:6px;color:#888">等待开始…</div>' +
             '<table style="width:100%;border-collapse:collapse">' +
             '<thead><tr>' +
             '<th style="text-align:left;border-bottom:1px solid #eee;padding:4px">className</th>' +
-            '<th style="text-align:right;border-bottom:1px solid #eee;padding:4px;width:130px;white-space:nowrap">学习状态</th>' +
-            '<th style="text-align:right;border-bottom:1px solid #eee;padding:4px;width:110px;white-space:nowrap">心跳(成功/失败)</th>' +
+            '<th style="text-align:right;border-bottom:1px solid #eee;padding:4px;width:120px;white-space:nowrap">状态</th>' +
+            '<th style="text-align:right;border-bottom:1px solid #eee;padding:4px;width:120px;white-space:nowrap">已刷/目标(秒)</th>' +
             '</tr></thead><tbody id="ph_tbody"></tbody></table>' +
-            '</div>';
+            '</div>'
 
-        document.body.appendChild(panel);
-        tbody = panel.querySelector('#ph_tbody');
-        statusEl = panel.querySelector('#ph_status');
+        document.body.appendChild(panel)
+        tbody = panel.querySelector('#ph_tbody')
+        statusEl = panel.querySelector('#ph_status')
 
         panel.querySelector('#ph_close').onclick = () => {
-            panelClosedHash = location.hash;
-            panel.style.display = 'none';
-        };
-        panel.querySelector('#ph_start').onclick = onStart;
-        panel.querySelector('#ph_stop').onclick = onStop;
-        panel.querySelector('#ph_clear').onclick = onClear;
+            panelClosedHash = location.hash
+            panel.style.display = 'none'
+        }
+        panel.querySelector('#ph_start').onclick = onStart
+        panel.querySelector('#ph_stop').onclick = onStop
+        panel.querySelector('#ph_clear').onclick = onClear
 
-        makeDraggable(panel, panel.querySelector('#ph_head'));
-        applyRouteVisibility();
+        makeDraggable(panel, panel.querySelector('#ph_head'))
+        applyRouteVisibility()
     }
 
-    const TARGET_HASH = '#/offlineTraining/courseReplay';
-    const SURVEY_HASH = '#/offlineTraining/viewingRecords';
-    let panelClosedHash = null;  // 主面板手动关闭时的 hash；同一 hash 下不再自动出现
-    let surveyClosedHash = null; // 问卷面板手动关闭时的 hash；同一 hash 下不再自动出现
-    let surveyPanel = null;   // 一键完成问卷面板
-    let surveyTbody = null;   // 问卷表格 tbody
-    let surveyStatusEl = null; // 问卷状态栏
-    let surveyBusy = false;   // 一键作答进行中，避免重复触发
-    const surveys = [];       // 待作答问卷列表 [{classId, className, queId, status, error}]
+    const TARGET_HASH = '#/offlineTraining/courseReplay'
+    const SURVEY_HASH = '#/offlineTraining/viewingRecords'
+    let panelClosedHash = null // 主面板手动关闭时的 hash；同一 hash 下不再自动出现
+    let surveyClosedHash = null // 问卷面板手动关闭时的 hash；同一 hash 下不再自动出现
+    let surveyPanel = null // 一键完成问卷面板
+    let surveyTbody = null // 问卷表格 tbody
+    let surveyStatusEl = null // 问卷状态栏
+    let surveyBusy = false // 一键作答进行中，避免重复触发
+    const surveys = [] // 待作答问卷列表 [{classId, className, queId, status, error}]
 
     // 一键完成问卷面板：仅在 viewingRecords 路由显示
     function buildSurveyPanel() {
-        surveyPanel = document.createElement('div');
+        surveyPanel = document.createElement('div')
         surveyPanel.style.cssText =
             'position:fixed;top:12px;right:12px;z-index:999999;width:460px;max-height:80vh;' +
             'overflow:auto;background:#fff;border:1px solid #ccc;border-radius:8px;' +
             'box-shadow:0 4px 16px rgba(0,0,0,.2);font-size:13px;color:#333;' +
-            'font-family:Arial,Microsoft YaHei,sans-serif;';
+            'font-family:Arial,Microsoft YaHei,sans-serif;'
 
         surveyPanel.innerHTML =
             '<div style="padding:8px 10px;background:#1677ff;color:#fff;border-radius:8px 8px 0 0;' +
@@ -401,52 +416,50 @@
             '<th style="text-align:left;border-bottom:1px solid #eee;padding:4px">课程名称</th>' +
             '<th style="text-align:right;border-bottom:1px solid #eee;padding:4px;width:130px;white-space:nowrap">操作</th>' +
             '</tr></thead><tbody id="ph_q_tbody"></tbody></table>' +
-            '</div>';
+            '</div>'
 
-        document.body.appendChild(surveyPanel);
-        surveyTbody = surveyPanel.querySelector('#ph_q_tbody');
-        surveyStatusEl = surveyPanel.querySelector('#ph_q_status');
+        document.body.appendChild(surveyPanel)
+        surveyTbody = surveyPanel.querySelector('#ph_q_tbody')
+        surveyStatusEl = surveyPanel.querySelector('#ph_q_status')
 
         surveyPanel.querySelector('#ph_q_close').onclick = () => {
-            surveyClosedHash = location.hash;
-            surveyPanel.style.display = 'none';
-        };
-        surveyPanel.querySelector('#ph_q_query').onclick = querySurveys;
-        surveyPanel.querySelector('#ph_q_all').onclick = onFillAll;
+            surveyClosedHash = location.hash
+            surveyPanel.style.display = 'none'
+        }
+        surveyPanel.querySelector('#ph_q_query').onclick = querySurveys
+        surveyPanel.querySelector('#ph_q_all').onclick = onFillAll
 
         // 事件委托：点击某行「完成问卷」按钮
         surveyTbody.addEventListener('click', (e) => {
-            const btn = e.target.closest('button[data-i]');
-            if (!btn) return;
-            const i = Number(btn.getAttribute('data-i'));
-            doOneSurvey(i);
-        });
+            const btn = e.target.closest('button[data-i]')
+            if (!btn) return
+            const i = Number(btn.getAttribute('data-i'))
+            doOneSurvey(i)
+        })
 
-        makeDraggable(surveyPanel, surveyPanel.querySelector('#ph_q_head'));
-        applySurveyVisibility();
+        makeDraggable(surveyPanel, surveyPanel.querySelector('#ph_q_head'))
+        applySurveyVisibility()
     }
 
     function setSurveyStatus(t) {
-        if (surveyStatusEl) surveyStatusEl.textContent = t;
+        if (surveyStatusEl) surveyStatusEl.textContent = t
     }
 
     // 查询待作答问卷：mypage 中 lookdb===1 且有已知答案的
     async function querySurveys() {
-        if (surveyBusy) return;
-        const queryBtn = surveyPanel.querySelector('#ph_q_query');
-        const allBtn = surveyPanel.querySelector('#ph_q_all');
-        const pageNum = surveyPanel.querySelector('#ph_q_pn').value.trim() || '1';
-        const pageSize = surveyPanel.querySelector('#ph_q_ps').value.trim() || '1000';
-        queryBtn.disabled = true;
-        allBtn.disabled = true;
-        surveys.length = 0;
-        renderSurveys();
+        if (surveyBusy) return
+        const queryBtn = surveyPanel.querySelector('#ph_q_query')
+        const allBtn = surveyPanel.querySelector('#ph_q_all')
+        const pageNum = surveyPanel.querySelector('#ph_q_pn').value.trim() || '1'
+        const pageSize = surveyPanel.querySelector('#ph_q_ps').value.trim() || '1000'
+        queryBtn.disabled = true
+        allBtn.disabled = true
+        surveys.length = 0
+        renderSurveys()
         try {
-            setSurveyStatus('查询课程列表…');
-            const list = await fetchMyPage(pageNum, pageSize);
-            const todo = list.filter(
-                (item) => item.lookdb === 1 && QUESTIONNAIRE_ANSWERS[item.queId]
-            );
+            setSurveyStatus('查询课程列表…')
+            const list = await fetchMyPage(pageNum, pageSize)
+            const todo = list.filter((item) => item.lookdb === 1 && QUESTIONNAIRE_ANSWERS[item.queId])
             for (const item of todo) {
                 surveys.push({
                     classId: item.classId,
@@ -454,448 +467,447 @@
                     queId: item.queId,
                     status: 'pending', // pending | doing | done | fail
                     error: null,
-                });
+                })
             }
-            renderSurveys();
-            setSurveyStatus('共 ' + surveys.length + ' 个待作答问卷');
-            allBtn.disabled = surveys.length === 0;
+            renderSurveys()
+            setSurveyStatus('共 ' + surveys.length + ' 个待作答问卷')
+            allBtn.disabled = surveys.length === 0
         } catch (e) {
-            setSurveyStatus('查询出错：' + ((e && e.message) || e));
+            setSurveyStatus('查询出错：' + ((e && e.message) || e))
         } finally {
-            queryBtn.disabled = false;
+            queryBtn.disabled = false
         }
     }
 
     function renderSurveys() {
-        if (!surveyTbody) return;
-        surveyTbody.innerHTML = '';
+        if (!surveyTbody) return
+        surveyTbody.innerHTML = ''
         surveys.forEach((s, i) => {
-            const tr = document.createElement('tr');
-            let opHtml;
+            const tr = document.createElement('tr')
+            let opHtml
             if (s.status === 'done') {
-                opHtml = '<span style="color:#52c41a">已完成</span>';
+                opHtml = '<span style="color:#52c41a">已完成</span>'
             } else if (s.status === 'fail') {
-                opHtml = '<button data-i="' + i + '" style="cursor:pointer;color:#ff4d4f">失败·重试</button>';
+                opHtml = '<button data-i="' + i + '" style="cursor:pointer;color:#ff4d4f">失败·重试</button>'
             } else if (s.status === 'doing') {
-                opHtml = '<button disabled>作答中…</button>';
+                opHtml = '<button disabled>作答中…</button>'
             } else {
-                opHtml = '<button data-i="' + i + '" style="cursor:pointer">完成问卷</button>';
+                opHtml = '<button data-i="' + i + '" style="cursor:pointer">完成问卷</button>'
             }
             tr.innerHTML =
-                '<td style="padding:4px;border-bottom:1px solid #f2f2f2">' + escapeHtml(s.className) + '</td>' +
-                '<td style="padding:4px;border-bottom:1px solid #f2f2f2;text-align:right">' + opHtml + '</td>';
-            surveyTbody.appendChild(tr);
-        });
+                '<td style="padding:4px;border-bottom:1px solid #f2f2f2">' +
+                escapeHtml(s.className) +
+                '</td>' +
+                '<td style="padding:4px;border-bottom:1px solid #f2f2f2;text-align:right">' +
+                opHtml +
+                '</td>'
+            surveyTbody.appendChild(tr)
+        })
     }
 
     // 完成单个问卷；成功→done，失败→fail
     async function doOneSurvey(i) {
-        const s = surveys[i];
-        if (!s || s.status === 'doing' || s.status === 'done') return true;
-        s.status = 'doing';
-        s.error = null;
-        renderSurveys();
+        const s = surveys[i]
+        if (!s || s.status === 'doing' || s.status === 'done') return true
+        s.status = 'doing'
+        s.error = null
+        renderSurveys()
         try {
-            await submitQuestionnaire(s.classId, s.queId);
-            s.status = 'done';
-            log('作答成功：' + s.className);
-            renderSurveys();
-            return true;
+            await submitQuestionnaire(s.classId, s.queId)
+            s.status = 'done'
+            console.log(LOG, '作答成功：' + s.className)
+            renderSurveys()
+            return true
         } catch (e) {
-            s.status = 'fail';
-            s.error = (e && e.message) || '作答失败';
-            log('作答失败：' + s.className, s.error);
-            renderSurveys();
-            return false;
+            s.status = 'fail'
+            s.error = (e && e.message) || '作答失败'
+            console.log(LOG, '作答失败：' + s.className, s.error)
+            renderSurveys()
+            return false
         }
     }
 
     // 一键完成：逐个完成所有未完成的问卷
     async function onFillAll() {
-        if (surveyBusy) return;
+        if (surveyBusy) return
         if (surveys.length === 0) {
-            setSurveyStatus('无待作答问卷，请先查询');
-            return;
+            setSurveyStatus('无待作答问卷，请先查询')
+            return
         }
-        surveyBusy = true;
-        const queryBtn = surveyPanel.querySelector('#ph_q_query');
-        const allBtn = surveyPanel.querySelector('#ph_q_all');
-        queryBtn.disabled = true;
-        allBtn.disabled = true;
-        let ok = 0, fail = 0;
+        surveyBusy = true
+        const queryBtn = surveyPanel.querySelector('#ph_q_query')
+        const allBtn = surveyPanel.querySelector('#ph_q_all')
+        queryBtn.disabled = true
+        allBtn.disabled = true
+        let ok = 0,
+            fail = 0
         try {
             for (let i = 0; i < surveys.length; i++) {
-                if (surveys[i].status === 'done') { ok++; continue; }
-                setSurveyStatus('正在作答 ' + (i + 1) + '/' + surveys.length + '：' + surveys[i].className);
-                const success = await doOneSurvey(i);
-                if (success) ok++; else fail++;
+                if (surveys[i].status === 'done') {
+                    ok++
+                    continue
+                }
+                setSurveyStatus('正在作答 ' + (i + 1) + '/' + surveys.length + '：' + surveys[i].className)
+                const success = await doOneSurvey(i)
+                if (success) ok++
+                else fail++
             }
-            setSurveyStatus('全部完成：成功 ' + ok + '，失败 ' + fail + '（共 ' + surveys.length + '）');
+            setSurveyStatus('全部完成：成功 ' + ok + '，失败 ' + fail + '（共 ' + surveys.length + '）')
         } finally {
-            surveyBusy = false;
-            queryBtn.disabled = false;
-            allBtn.disabled = false;
+            surveyBusy = false
+            queryBtn.disabled = false
+            allBtn.disabled = false
         }
     }
 
     function applySurveyVisibility() {
-        if (!surveyPanel) return;
-        const match = location.hash.indexOf(SURVEY_HASH) === 0;
+        if (!surveyPanel) return
+        const match = location.hash.indexOf(SURVEY_HASH) === 0
         if (match) {
-            if (location.hash === surveyClosedHash) return; // 已在此路由手动关闭，保持隐藏
-            if (!document.body.contains(surveyPanel)) document.body.appendChild(surveyPanel);
-            surveyPanel.style.display = '';
+            if (location.hash === surveyClosedHash) return // 已在此路由手动关闭，保持隐藏
+            if (!document.body.contains(surveyPanel)) document.body.appendChild(surveyPanel)
+            surveyPanel.style.display = ''
         } else {
-            surveyClosedHash = null; // 离开该路由，重置关闭标记
-            surveyPanel.style.display = 'none';
+            surveyClosedHash = null // 离开该路由，重置关闭标记
+            surveyPanel.style.display = 'none'
         }
     }
 
     function applyRouteVisibility() {
-        applySurveyVisibility();
-        if (!panel) return;
-        const match = location.hash.indexOf(TARGET_HASH) === 0;
+        applySurveyVisibility()
+        if (!panel) return
+        const match = location.hash.indexOf(TARGET_HASH) === 0
         if (match) {
-            if (location.hash === panelClosedHash) return; // 已在此路由手动关闭，保持隐藏
+            if (location.hash === panelClosedHash) return // 已在此路由手动关闭，保持隐藏
             // SPA 切换路由可能把面板从 DOM 移除，这里确保重新挂载
-            if (!document.body.contains(panel)) document.body.appendChild(panel);
-            panel.style.display = '';
+            if (!document.body.contains(panel)) document.body.appendChild(panel)
+            panel.style.display = ''
         } else {
-            panelClosedHash = null; // 离开该路由，重置关闭标记
-            panel.style.display = 'none';
+            panelClosedHash = null // 离开该路由，重置关闭标记
+            panel.style.display = 'none'
         }
     }
 
     function makeDraggable(el, handle) {
-        let sx, sy, ox, oy, drag = false;
+        let sx, sy, ox, oy, drag = false
         handle.addEventListener('mousedown', (e) => {
-            drag = true; sx = e.clientX; sy = e.clientY;
-            const r = el.getBoundingClientRect(); ox = r.left; oy = r.top;
-            e.preventDefault();
-        });
+            drag = true
+            sx = e.clientX
+            sy = e.clientY
+            const r = el.getBoundingClientRect()
+            ox = r.left
+            oy = r.top
+            e.preventDefault()
+        })
         document.addEventListener('mousemove', (e) => {
-            if (!drag) return;
-            el.style.left = ox + (e.clientX - sx) + 'px';
-            el.style.top = oy + (e.clientY - sy) + 'px';
-            el.style.right = 'auto';
-        });
-        document.addEventListener('mouseup', () => (drag = false));
+            if (!drag) return
+            el.style.left = ox + (e.clientX - sx) + 'px'
+            el.style.top = oy + (e.clientY - sy) + 'px'
+            el.style.right = 'auto'
+        })
+        document.addEventListener('mouseup', () => (drag = false))
     }
 
     function setStatus(t) {
-        if (statusEl) statusEl.textContent = t;
+        if (statusEl) statusEl.textContent = t
     }
 
     function render() {
-        if (!tbody) return;
-        tbody.innerHTML = '';
+        if (!tbody) return
+        tbody.innerHTML = ''
         for (const c of courses) {
-            const tr = document.createElement('tr');
-            let statusText;
+            const tr = document.createElement('tr')
+            let statusText
             if (c.error) {
-                statusText = '⚠' + c.error;
-            } else if (c.completed) {
-                statusText = '已完成';
-            } else if (c.playStartTs && c.targetSec != null) {
-                const sec = Math.floor((Date.now() - c.playStartTs) / 1000);
-                statusText = sec + '/' + c.targetSec;
+                statusText = '⚠' + c.error
+            } else if (c.status === 'skipped') {
+                statusText = '已跳过' + (c.note ? '(' + c.note + ')' : '')
+            } else if (c.status === 'done') {
+                statusText = '已完成'
+            } else if (c.status === 'running') {
+                statusText = '刷课中'
             } else {
-                statusText = '初始化中';
+                statusText = '排队中'
             }
-            const name = c.className;
-            const hb = c.hbStarted ? (c.hbOk || 0) + ' / ' + (c.hbFail || 0) : '-';
+            const progress = (c.watchedSec || 0) + ' / ' + (c.targetSec || 0)
             tr.innerHTML =
-                '<td style="padding:4px;border-bottom:1px solid #f2f2f2">' + escapeHtml(name) + '</td>' +
-                '<td style="padding:4px;border-bottom:1px solid #f2f2f2;text-align:right">' + escapeHtml(statusText) + '</td>' +
-                '<td style="padding:4px;border-bottom:1px solid #f2f2f2;text-align:right">' + hb + '</td>';
-            tbody.appendChild(tr);
+                '<td style="padding:4px;border-bottom:1px solid #f2f2f2">' +
+                escapeHtml(c.className) +
+                '</td>' +
+                '<td style="padding:4px;border-bottom:1px solid #f2f2f2;text-align:right">' +
+                escapeHtml(statusText) +
+                '</td>' +
+                '<td style="padding:4px;border-bottom:1px solid #f2f2f2;text-align:right">' +
+                escapeHtml(progress) +
+                '</td>'
+            tbody.appendChild(tr)
         }
-    }
-
-    function escapeHtml(s) {
-        return String(s).replace(/[&<>"]/g, (m) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[m]));
     }
 
     // ---------- 主流程 ----------
-    let started = false;
-    let stopped = false;
-    let renderTimer = null;
-    let keepaliveTimer = null; // 每 10min 请求一次列表接口，防止 token 失效
-    let curPage = null;    // 当前学习的页码
-    let curPageEnd = null;   // 结束页码（含）
-    let shared = null; // {accountId, viewername, viewertoken}，首个课程初始化时获取一次
+    let started = false
+    let stopped = false
+    let concurrency = 1 // 同时打开的播放窗口数（pump/monitorTick 共用，需在模块作用域）
+    let renderTimer = null
+    let monitorTimer = null
+    let keepaliveTimer = null // 每 10min 请求一次列表接口，防止 token 失效
 
     async function onStart() {
         if (started) {
-            setStatus('已在运行中');
-            return;
+            setStatus('已在运行中')
+            return
         }
-        stopped = false;
-        const pageNum = parseInt(panel.querySelector('#ph_pn').value.trim(), 10);
-        const pageSize = panel.querySelector('#ph_ps').value.trim();
-        const totalPages = parseInt(panel.querySelector('#ph_tp').value.trim(), 10) || 1;
-        if (!pageNum || !pageSize) {
-            alert('请填写 pageNum / pageSize');
-            return;
+        stopped = false
+        const totalCount = parseInt(panel.querySelector('#ph_count').value.trim(), 10)
+        concurrency = parseInt(panel.querySelector('#ph_conc').value.trim(), 10) || 1
+        if (!totalCount) {
+            alert('请填写刷课门数')
+            return
         }
 
-        started = true;
-        panel.querySelector('#ph_start').disabled = true;
-        panel.querySelector('#ph_stop').disabled = false;
-        panel.querySelector('#ph_clear').disabled = true;
+        started = true
+        panel.querySelector('#ph_start').disabled = true
+        panel.querySelector('#ph_stop').disabled = false
+        panel.querySelector('#ph_clear').disabled = true
 
-        // 每 10s 刷新显示（与 heartbeat 间隔一致）
-        renderTimer = setInterval(render, HEARTBEAT_INTERVAL);
-
-        // 每 10min 请求一次列表接口（pageNum/pageSize 均传 1），仅为保活 token，不处理结果
+        renderTimer = setInterval(render, RENDER_INTERVAL)
         keepaliveTimer = setInterval(() => {
             fetchPlaybackList(1, 1)
-                .then(() => log('token 保活请求成功'))
-                .catch((err) => console.warn('[线下培训] token 保活请求失败', err));
-        }, KEEPALIVE_INTERVAL);
+                .then(() => console.log(LOG, 'token 保活请求成功'))
+                .catch((err) => console.warn(LOG, 'token 保活请求失败', err))
+        }, KEEPALIVE_INTERVAL)
 
         try {
-            // 从 pageNum 开始，连续学习 totalPages 页
-            const lastPage = pageNum + totalPages - 1;
-            for (let pn = pageNum; pn <= lastPage; pn++) {
-                if (stopped) break;
-                curPage = pn;
-                curPageEnd = lastPage;
-                await runPage(pn, pageSize);
-                if (stopped) break;
-                // 本页全部完成后，等待所有心跳到达目标时长（课程真正学满）
-                await waitPageDone();
+            setStatus('获取课程列表…')
+            const list = await fetchPlaybackList(1, totalCount)
+            courses.length = 0
+            queue.length = 0
+            active.length = 0
+            for (const item of list) {
+                courses.push({
+                    classId: item.id,
+                    className: item.className,
+                    status: 'pending',
+                    watchedSec: 0,
+                    targetSec: 0,
+                    recordid: null,
+                    url: null,
+                    error: null,
+                    note: null,
+                })
             }
-            if (!stopped) {
-                setStatus('全部 ' + totalPages + ' 页学习完成');
-                // 收尾：关闭定时器、复位按钮
-                if (renderTimer) { clearInterval(renderTimer); renderTimer = null; }
-                if (keepaliveTimer) { clearInterval(keepaliveTimer); keepaliveTimer = null; }
-                render();
-                started = false;
-                curPage = null;
-                panel.querySelector('#ph_start').disabled = false;
-                panel.querySelector('#ph_stop').disabled = true;
-                panel.querySelector('#ph_clear').disabled = courses.length === 0;
+            render()
+
+            setStatus('判定学习状态…')
+            for (const c of courses) {
+                if (stopped) break
+                try {
+                    const status = await checkStatus(c.classId)
+                    if (isCompleted(status)) {
+                        c.status = 'skipped'
+                        c.note = '服务端已完成'
+                        render()
+                        continue
+                    }
+                    c.targetSec = (Number(status.liveTimeLimit) + 10 - Number(status.watchtime)) * 60
+                    console.log(LOG, '未完成，目标学习秒数:', c.className, c.targetSec)
+
+                    // 当天本地进度：已刷满 → 跳过；未刷满 → 沿用 watchedSec 续刷
+                    const p = getProgress()
+                    const ex = p[c.classId]
+                    if (ex && ex.date === todayStr() && (ex.watchedSec || 0) >= ex.targetSec) {
+                        c.status = 'skipped'
+                        c.note = '今日已刷满'
+                        c.watchedSec = ex.watchedSec
+                        render()
+                        continue
+                    }
+                    if (ex && ex.date === todayStr()) c.watchedSec = ex.watchedSec || 0
+
+                    const stu = await fetchStudentFirst(c.classId)
+                    if (!stu || !stu.recordid) {
+                        c.status = 'error'
+                        c.error = '无回放记录'
+                        render()
+                        continue
+                    }
+                    c.recordid = stu.recordid
+                    c.url = await fetchRecordUrl(c.recordid)
+                    queue.push(c)
+                } catch (e) {
+                    c.status = 'error'
+                    c.error = (e && e.message) || '初始化失败'
+                    console.error(LOG, '初始化失败', c.className, e)
+                }
+                render()
             }
+
+            if (stopped) {
+                finishRun('已停止')
+                return
+            }
+            setStatus('开始刷课…')
+            pump()
+            monitorTimer = setInterval(monitorTick, RENDER_INTERVAL)
         } catch (e) {
-            setStatus('出错：' + ((e && e.message) || e));
-            started = false;
-            if (renderTimer) {
-                clearInterval(renderTimer);
-                renderTimer = null;
-            }
-            if (keepaliveTimer) {
-                clearInterval(keepaliveTimer);
-                keepaliveTimer = null;
-            }
-            panel.querySelector('#ph_start').disabled = false;
-            panel.querySelector('#ph_stop').disabled = true;
-            panel.querySelector('#ph_clear').disabled = courses.length === 0;
+            setStatus('出错：' + ((e && e.message) || e))
+            finishRun()
         }
     }
 
-    // 页码进度前缀，如「[1/3页] 」
-    function pageTag() {
-        if (curPage == null) return '';
-        return '[' + curPage + '/' + curPageEnd + '页] ';
+    // 按并发数从队列开窗；开窗前先把进度写入 GM，供 worker 接管
+    // 串行起播：同一时间只允许一个"已开但未确认起播"的窗口，避免多窗口初始化竞争
+    function pump() {
+        if (stopped) return
+        // 已有窗口尚未起播时，等它起播再开下一个
+        const pendingStart = active.some((a) => !a.started)
+        if (pendingStart) return
+        while (!stopped && active.length < concurrency && queue.length) {
+            const c = queue.shift()
+            const p = getProgress()
+            p[c.classId] = {
+                className: c.className,
+                recordid: c.recordid,
+                watchedSec: c.watchedSec || 0,
+                targetSec: c.targetSec,
+                date: todayStr(),
+            }
+            saveProgress(p)
+
+            const win = window.open(c.url)
+            if (!win) {
+                c.status = 'error'
+                c.error = '弹窗被拦截，请允许本站弹窗'
+                render()
+                continue // 继续尝试下一门
+            }
+            active.push({
+                win,
+                classId: c.classId,
+                openTs: Date.now(),
+                startWatchedSec: c.watchedSec || 0, // 起播判定基线
+                started: false, // watchedSec 增长后置 true
+            })
+            c.status = 'running'
+            console.log(LOG, '已打开播放窗口:', c.className)
+            render()
+            break // 开一个就停，等它起播（或它已在前台立即起播由 monitorTick 确认后继续）
+        }
     }
 
-    // 加载并初始化某一页的全部课程（初始化后各课程心跳持续到达标）
-    async function runPage(pn, pageSize) {
-        // 切换到新页：清空表格与上一页数据
-        shared = null;
-        for (const c of courses) {
-            if (c.timer) { clearInterval(c.timer); c.timer = null; }
-        }
-        courses.length = 0;
-        render();
+    // 每 RENDER_INTERVAL：读 watchedSec 判起播/到点关窗；窗口提前关闭则标记错误；空位则 pump
+    function monitorTick() {
+        if (stopped) return
+        const p = getProgress()
+        for (let i = active.length - 1; i >= 0; i--) {
+            const a = active[i]
+            const c = courses.find((x) => x.classId === a.classId)
+            const entry = p[a.classId]
+            if (entry) c.watchedSec = entry.watchedSec || 0
 
-        setStatus(pageTag() + '获取课程列表…');
-        const list = await fetchPlaybackList(pn, pageSize);
+            // watchedSec 相比开窗时增长 → 确认已起播，允许开下一个窗口
+            if (!a.started && c.watchedSec > a.startWatchedSec) {
+                a.started = true
+                console.log(LOG, '已确认起播:', c.className, 'watchedSec=', c.watchedSec)
+            }
 
-        // 先把所有课程名铺进表格
-        for (const item of list) {
-            courses.push({
-                classId: item.id,
-                className: item.className,
-                accountId: null,
-                roomid: null,
-                recordid: null,
-                viewerid: null,
-                upid: null,
-                token: null,
-                playStartTs: null,
-                completed: false,
-                targetSec: null,
-                error: null,
-                hbOk: 0,
-                hbFail: 0,
-            });
-        }
-        render();
-        setStatus(pageTag() + '共 ' + list.length + ' 节课，开始逐个初始化…');
-
-        // 再逐个初始化
-        for (const c of courses) {
-            if (stopped) break;
+            let closed = false
             try {
-                await setupCourse(c);
+                closed = a.win.closed
             } catch (e) {
-                c.error = (e && e.message) || '初始化失败';
-                console.error('[心跳] 初始化失败', c.className, e);
+                closed = true
             }
-            render();
+
+            // 到目标时长 → 主窗口关窗（跨域允许 close 自己 open 的窗）
+            if (!closed && c.watchedSec >= c.targetSec) {
+                try {
+                    a.win.close()
+                } catch (e) { }
+                closed = true
+                c.status = 'done'
+                console.log(LOG, '达到目标时长，已关闭窗口:', c.className, c.watchedSec, '>=', c.targetSec)
+            }
+
+            if (closed) {
+                // 关闭但未达标 → 标记错误（不自动重开，避免循环）
+                if (c.status !== 'done') {
+                    c.status = 'error'
+                    c.error = '窗口提前关闭'
+                }
+                active.splice(i, 1)
+            }
         }
-        setStatus(pageTag() + '本页初始化完成，等待课程学满…');
+
+        pump()
+
+        // 队列空、活动窗口空、无排队中课程 → 全部完成
+        const allDone = courses.every((c) => c.status === 'done' || c.status === 'skipped' || c.status === 'error')
+        if (!stopped && queue.length === 0 && active.length === 0 && allDone) {
+            finishRun('全部刷课完成')
+        }
+        render()
     }
 
-    // 等待当前页所有课程结束（completed 或 error）
-    function waitPageDone() {
-        return new Promise((resolve) => {
-            const check = () => {
-                if (stopped) { resolve(); return; }
-                const total = courses.length;
-                const done = courses.filter((c) => c.completed || c.error).length;
-                if (total === 0 || done === total) { resolve(); return; }
-                setStatus('正在学习 ' + curPage + '/' + curPageEnd + '页（本页已完成 ' + done + '/' + total + ' 节）');
-                setTimeout(check, HEARTBEAT_INTERVAL);
-            };
-            check();
-        });
+    function finishRun(msg) {
+        started = false
+        if (renderTimer) {
+            clearInterval(renderTimer)
+            renderTimer = null
+        }
+        if (monitorTimer) {
+            clearInterval(monitorTimer)
+            monitorTimer = null
+        }
+        if (keepaliveTimer) {
+            clearInterval(keepaliveTimer)
+            keepaliveTimer = null
+        }
+        for (const a of active) {
+            try {
+                a.win.close()
+            } catch (e) { }
+        }
+        active.length = 0
+        queue.length = 0
+        panel.querySelector('#ph_start').disabled = false
+        panel.querySelector('#ph_stop').disabled = true
+        panel.querySelector('#ph_clear').disabled = false
+        if (msg) setStatus(msg)
+        render()
     }
 
     function onStop() {
-        stopped = true;
-        for (const c of courses) {
-            if (c.timer) {
-                clearInterval(c.timer);
-                c.timer = null;
-            }
-        }
-        if (renderTimer) {
-            clearInterval(renderTimer);
-            renderTimer = null;
-        }
-        if (keepaliveTimer) {
-            clearInterval(keepaliveTimer);
-            keepaliveTimer = null;
-        }
-        render();
-        started = false;
-        curPage = null;
-        panel.querySelector('#ph_start').disabled = false;
-        panel.querySelector('#ph_stop').disabled = true;
-        panel.querySelector('#ph_clear').disabled = courses.length === 0;
-        setStatus('已停止（心跳已全部关闭）');
+        stopped = true
+        finishRun('已停止')
     }
 
     function onClear() {
-        if (started) return; // 运行中不允许清除
-        courses.length = 0;
-        shared = null;
-        render();
-        panel.querySelector('#ph_clear').disabled = true;
-        setStatus('已清除');
-    }
-
-    async function setupCourse(c) {
-        log('开始初始化:', c.className);
-
-        // 学习前先查状态
-        const status = await checkStatus(c.classId);
-        if (isCompleted(status)) {
-            c.completed = true;
-            log('已完成，跳过:', c.className, '(isnormal=', status.isnormal, 'watchtime=', status.watchtime, 'liveTimeLimit=', status.liveTimeLimit, ')');
-            render();
-            return;
-        }
-        c.targetSec = (Number(status.liveTimeLimit) + 10 - Number(status.watchtime)) * 60;
-        log('未完成，目标学习秒数:', c.className, c.targetSec, '(liveTimeLimit=', status.liveTimeLimit, 'watchtime=', status.watchtime, ')');
-
-        const stu = await fetchStudentFirst(c.classId);
-        if (!stu) throw new Error('无回放记录');
-        c.roomid = stu.roomid;
-        c.recordid = stu.recordid;
-
-        // 首个课程时获取一次 accountId / viewername / viewertoken（accountId 固定，全局复用）
-        if (!shared) {
-            shared = await fetchRecordUrl(c.recordid);
-            log('GetRecordUrl 完成: accountId=', shared.accountId, 'viewername=', shared.viewername, 'viewertoken=', shared.viewertoken);
-        }
-        c.accountId = shared.accountId;
-
-        // 先登录拿 token / viewerid / roomid（失败每 1s 重试）
-        log('登录中:', c.className, 'replayId=', c.recordid);
-        const user = await loginReplay(c.accountId, c.recordid, shared.viewername, shared.viewertoken, (n) => {
-            c.error = '登录重试中(' + n + ')';
-            render();
-            log('登录重试:', c.className, '第', n, '次');
-        });
-        c.error = null;
-        c.token = user.token;
-        c.viewerid = user.id;
-        if (user.roomId) c.roomid = user.roomId;
-        log('登录成功:', c.className, 'viewerid=', c.viewerid, 'roomid=', c.roomid, 'token=', c.token);
-
-        // meta 拿 upid
-        const meta = await fetchMeta(c.accountId, c.recordid, c.token);
-        c.upid = meta.upid;
-        if (!c.viewerid) c.viewerid = meta.viewerid;
-        log('meta 完成:', c.className, 'upid=', c.upid);
-
-        await callLogin(c);
-        log('login 上报已调用:', c.className);
-        await callPlay(c);
-        c.playStartTs = Date.now();
-        log('play 已调用:', c.className);
-        render();
-
-        // 每 10s 一次心跳，持续不断
-        c.timer = setInterval(() => {
-            // 达到目标时长：标记已完成并停止心跳
-            const sec = Math.floor((Date.now() - c.playStartTs) / 1000);
-            if (c.targetSec != null && sec > c.targetSec) {
-                c.completed = true;
-                clearInterval(c.timer);
-                c.timer = null;
-                log('达到目标时长，已完成并停止心跳:', c.className, sec, '>', c.targetSec);
-                render();
-                return;
-            }
-            if (!c.hbStarted) {
-                c.hbStarted = true;
-                log('首次心跳:', c.className);
-            }
-            callHeartbeat(c)
-                .then((r) => {
-                    if (r.status >= 200 && r.status < 300) c.hbOk++;
-                    else c.hbFail++;
-                })
-                .catch((err) => {
-                    c.hbFail++;
-                    console.warn('[线下培训] heartbeat 失败', c.className, err);
-                });
-        }, HEARTBEAT_INTERVAL);
+        if (started) return // 运行中不允许清除
+        saveProgress({})
+        courses.length = 0
+        render()
+        setStatus('已清除本地进度')
     }
 
     // ---------- 启动 ----------
-    function init() {
-        if (document.getElementById('ph_tbody')) return;
-        log('脚本已加载 @', location.href);
-        buildUI();
-        buildSurveyPanel();
-        window.addEventListener('hashchange', applyRouteVisibility);
-        window.addEventListener('popstate', applyRouteVisibility);
-        // 兜底：SPA 用 history.pushState 切换路由不触发 hashchange，
-        // 且可能把面板移出 DOM，这里每 500ms 校正一次显隐与挂载
-        setInterval(applyRouteVisibility, 500);
+    // 播放窗口：仅运行 worker
+    if (location.host.indexOf('view.csslcloud.net') === 0) {
+        runWorker()
+        return
     }
 
-    if (document.body) init();
-    else window.addEventListener('DOMContentLoaded', init);
-})();
+    function init() {
+        if (document.getElementById('ph_tbody')) return
+        console.log(LOG, '脚本已加载 @', location.href)
+        buildUI()
+        buildSurveyPanel()
+        window.addEventListener('hashchange', applyRouteVisibility)
+        window.addEventListener('popstate', applyRouteVisibility)
+        // 兜底：SPA 用 history.pushState 切换路由不触发 hashchange，
+        // 且可能把面板移出 DOM，这里每 500ms 校正一次显隐与挂载
+        setInterval(applyRouteVisibility, 500)
+    }
 
-// 方案2，直接浏览器打开 GetRecordUrl 返回的地址
-// btn = document.getElementById("cc_player_play_btn")
-// btn.click()
+    if (document.body) init()
+    else window.addEventListener('DOMContentLoaded', init)
+})()
