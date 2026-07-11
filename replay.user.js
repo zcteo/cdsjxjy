@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         成都市中小学教师继续教育网-线下培训助手
-// @namespace    https://www.cdsjxjy.cn/
+// @namespace    https://github.com/zcteo
 // @version      1.1.0
 // @description  课程自动回放，观看记录页面自动完成问卷
 // @author       zcteo.cn@gmail.com
+// @license      AGPL-3.0-only
 // @match        https://www.cdsjxjy.cn/*
 // @match        https://view.csslcloud.net/*
 // @grant        GM_xmlhttpRequest
