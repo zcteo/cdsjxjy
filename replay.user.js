@@ -18,7 +18,7 @@
 // 仅供学习使用，作者不对该脚本产生的任何行为负责，严谨倒卖！！！
 // 尊重作者权益，请勿在未经允许的情况下擅自修改代码和发布到其他平台！
 // 仅支持 ad1a2087-a431-422f-a6cc-e28a8cb0dde8 问卷！
-// 更新日期：2026-07-11
+// 更新日期：2026-07-12
 // ****************************************************************************************
 
 ; (function () {
@@ -57,7 +57,7 @@
         const p2 = (n) => String(n).padStart(2, '0')
         const date = d.getFullYear() + '-' + p2(d.getMonth() + 1) + '-' + p2(d.getDate())
         const time = p2(d.getHours()) + ':' + p2(d.getMinutes()) + ':' + p2(d.getSeconds())
-        return date + ' ' + time + ' ' + '[线下培训]'
+        return date + ' ' + time + ' [线下培训]'
     }
 
     function gmRequest(opts) {
