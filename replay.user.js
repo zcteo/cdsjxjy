@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         成都市中小学教师继续教育网-线下培训助手
 // @namespace    https://github.com/zcteo
-// @version      1.1.0
+// @version      1.2.0
 // @description  课程自动回放，观看记录页面自动完成问卷
 // @author       zcteo.cn@gmail.com
 // @license      AGPL-3.0-only
@@ -23,7 +23,6 @@
 
 ; (function () {
     'use strict'
-    const LOG = '[线下培训]'
     const COURSE_LEVEL_ID = '7CE980E9-FDC1-45DC-9033-D9D12E7EA432' // 全学段
     const RENDER_INTERVAL = 2000 // 主面板刷新 + 窗口监控
     const KEEPALIVE_INTERVAL = 600000 // 10min，定时请求列表接口防止 token 失效
@@ -50,6 +49,17 @@
     };
 
     // ---------- 通用 ----------
+
+    // 日志前缀：人类可读时间到秒 + 标识，如「2026-07-12 13:01:02 [线下培训]」
+    // 仅返回字符串、不调 console，故各调用点的 console.log 仍能在控制台定位到真实行号
+    function logpre() {
+        const d = new Date()
+        const p2 = (n) => String(n).padStart(2, '0')
+        const date = d.getFullYear() + '-' + p2(d.getMonth() + 1) + '-' + p2(d.getDate())
+        const time = p2(d.getHours()) + ':' + p2(d.getMinutes()) + ':' + p2(d.getSeconds())
+        return date + ' ' + time + ' ' + '[线下培训]'
+    }
+
     function gmRequest(opts) {
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
@@ -106,20 +116,16 @@
     }
 
     // ---------- 本地进度（GM 跨域共享）----------
-    // progress[classId] = { className, recordid, watchedSec, targetSec, date }
+    // progress[classId] = { className, recordid, watchedSec, targetSec, finishedAt }
+    // finishedAt：本地刷满时的时间戳（毫秒，仅刷满时写入），用于 2 天安全阀
     const PROGRESS_KEY = 'cdsjxjy_progress'
+    const STALE_MS = 2 * 86400000 // 本地刷满但服务端仍未确认，超过 2 天判定刷课失败、重刷
 
     function getProgress() {
         return GM_getValue(PROGRESS_KEY, {}) || {}
     }
     function saveProgress(p) {
         GM_setValue(PROGRESS_KEY, p)
-    }
-    function todayStr() {
-        const d = new Date()
-        return (
-            d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0')
-        )
     }
     // 按 recordid 反查 classId（播放窗口只知 recordid）
     function findClassIdByRecordid(progress, recordid) {
@@ -166,11 +172,6 @@
         function btnVisible(el) {
             return !!el && window.getComputedStyle(el).display !== 'none'
         }
-        function nowStr() {
-            const d = new Date()
-            const p2 = (n) => String(n).padStart(2, '0')
-            return p2(d.getHours()) + ':' + p2(d.getMinutes()) + ':' + p2(d.getSeconds())
-        }
 
         // 每 WORKER_PROBE_INTERVAL：拿不到按钮且超宽限期 → 刷新重试；
         // 按钮可见 → 点击；按钮已隐藏(正在播) → 累加 watchedSec。
@@ -184,23 +185,22 @@
             const el = playBtn()
             if (!el) {
                 // 按钮未渲染：宽限期内等 SDK 初始化，超过则判定登录失败、刷新重试
-                console.log(LOG, nowStr(), '按钮未渲染, 等待SDK:', e.data.className)
+                console.log(logpre(), '按钮未渲染, 等待SDK:', e.data.className)
                 if (Date.now() - loadTs > RELOAD_GRACE) {
-                    console.log(LOG, nowStr(), '超宽限期仍未渲染, 刷新页面:', e.data.className)
+                    console.log(logpre(), '超宽限期仍未渲染, 刷新页面:', e.data.className)
                     location.reload()
                 }
                 return
             }
             if (btnVisible(el)) {
                 el.click()
-                console.log(LOG, nowStr(), '点击播放(按钮可见):', e.data.className)
+                console.log(logpre(), '点击播放(按钮可见):', e.data.className)
             } else {
                 // 按钮已隐藏 = 正在播放，累加 watchedSec（与探测同频）
                 const p = getProgress()
                 const d = p[e.classId]
                 if (d && d.watchedSec < d.targetSec) {
                     d.watchedSec = (d.watchedSec || 0) + WORKER_PROBE_INTERVAL / 1000
-                    d.date = todayStr()
                     p[e.classId] = d
                     saveProgress(p)
                 }
@@ -213,7 +213,7 @@
             // 按钮仍可见会在下个 tick 继续点击，直到播放成功按钮隐藏
         }, WORKER_PROBE_INTERVAL)
 
-        console.log(LOG, 'worker 已加载, recordid=' + recordid)
+        console.log(logpre(), 'worker 已加载, recordid=' + recordid)
     }
 
     // ==================================================================
@@ -516,13 +516,13 @@
         try {
             await submitQuestionnaire(s.classId, s.queId)
             s.status = 'done'
-            console.log(LOG, '作答成功：' + s.className)
+            console.log(logpre(), '作答成功：' + s.className)
             renderSurveys()
             return true
         } catch (e) {
             s.status = 'fail'
             s.error = (e && e.message) || '作答失败'
-            console.log(LOG, '作答失败：' + s.className, s.error)
+            console.log(logpre(), '作答失败：' + s.className, s.error)
             renderSurveys()
             return false
         }
@@ -674,8 +674,8 @@
         renderTimer = setInterval(render, RENDER_INTERVAL)
         keepaliveTimer = setInterval(() => {
             fetchPlaybackList(1, 1)
-                .then(() => console.log(LOG, 'token 保活请求成功'))
-                .catch((err) => console.warn(LOG, 'token 保活请求失败', err))
+                .then(() => console.log(logpre(), 'token 保活请求成功'))
+                .catch((err) => console.warn(logpre(), 'token 保活请求失败', err))
         }, KEEPALIVE_INTERVAL)
 
         try {
@@ -704,26 +704,40 @@
                 if (stopped) break
                 try {
                     const status = await checkStatus(c.classId)
+                    const p = getProgress()
+                    const ex = p[c.classId]
+
                     if (isCompleted(status)) {
                         c.status = 'skipped'
                         c.note = '服务端已完成'
+                        if (ex) {
+                            // 服务端已确认，本地记录已完成使命，清掉
+                            delete p[c.classId]
+                            saveProgress(p)
+                        }
                         render()
                         continue
                     }
                     c.targetSec = (Number(status.liveTimeLimit) + 10 - Number(status.watchtime)) * 60
-                    console.log(LOG, '未完成，目标学习秒数:', c.className, c.targetSec)
+                    console.log(logpre(), '未完成，目标学习秒数:', c.className, c.targetSec)
 
-                    // 当天本地进度：已刷满 → 跳过；未刷满 → 沿用 watchedSec 续刷
-                    const p = getProgress()
-                    const ex = p[c.classId]
-                    if (ex && ex.date === todayStr() && (ex.watchedSec || 0) >= ex.targetSec) {
-                        c.status = 'skipped'
-                        c.note = '今日已刷满'
-                        c.watchedSec = ex.watchedSec
-                        render()
-                        continue
+                    // 服务端未确认，但本地已刷满：
+                    //   距刷满 < 2 天 → 跳过（等服务端刷新，不重复刷）
+                    //   距刷满 ≥ 2 天 → 服务端仍未认，判定刷课失败，重刷
+                    if (ex && (ex.watchedSec || 0) >= ex.targetSec) {
+                        const age = Date.now() - (ex.finishedAt || 0)
+                        if (age < STALE_MS) {
+                            c.status = 'skipped'
+                            c.note = '本地已刷满，待服务端刷新'
+                            c.watchedSec = ex.watchedSec
+                            render()
+                            continue
+                        }
+                        console.log(logpre(), '本地已刷满超 2 天服务端仍未确认，重刷:', c.className)
+                    } else if (ex) {
+                        // 本地未刷满 → 沿用已刷 watchedSec 续刷
+                        c.watchedSec = ex.watchedSec || 0
                     }
-                    if (ex && ex.date === todayStr()) c.watchedSec = ex.watchedSec || 0
 
                     const stu = await fetchStudentFirst(c.classId)
                     if (!stu || !stu.recordid) {
@@ -738,7 +752,7 @@
                 } catch (e) {
                     c.status = 'error'
                     c.error = (e && e.message) || '初始化失败'
-                    console.error(LOG, '初始化失败', c.className, e)
+                    console.error(logpre(), '初始化失败', c.className, e)
                 }
                 render()
             }
@@ -771,7 +785,6 @@
                 recordid: c.recordid,
                 watchedSec: c.watchedSec || 0,
                 targetSec: c.targetSec,
-                date: todayStr(),
             }
             saveProgress(p)
 
@@ -790,7 +803,7 @@
                 started: false, // watchedSec 增长后置 true
             })
             c.status = 'running'
-            console.log(LOG, '已打开播放窗口:', c.className)
+            console.log(logpre(), '已打开播放窗口:', c.className)
             render()
             break // 开一个就停，等它起播（或它已在前台立即起播由 monitorTick 确认后继续）
         }
@@ -809,7 +822,7 @@
             // watchedSec 相比开窗时增长 → 确认已起播，允许开下一个窗口
             if (!a.started && c.watchedSec > a.startWatchedSec) {
                 a.started = true
-                console.log(LOG, '已确认起播:', c.className, 'watchedSec=', c.watchedSec)
+                console.log(logpre(), '已确认起播:', c.className, 'watchedSec=', c.watchedSec)
             }
 
             let closed = false
@@ -826,7 +839,13 @@
                 } catch (e) { }
                 closed = true
                 c.status = 'done'
-                console.log(LOG, '达到目标时长，已关闭窗口:', c.className, c.watchedSec, '>=', c.targetSec)
+                // 由主窗口写 finishedAt：关窗与 worker 写入存在竞态，主窗口写更可靠
+                const entryDone = p[a.classId]
+                if (entryDone) {
+                    entryDone.finishedAt = Date.now()
+                    saveProgress(p)
+                }
+                console.log(logpre(), '达到目标时长，已关闭窗口:', c.className, c.watchedSec, '>=', c.targetSec)
             }
 
             if (closed) {
@@ -899,7 +918,7 @@
 
     function init() {
         if (document.getElementById('ph_tbody')) return
-        console.log(LOG, '脚本已加载 @', location.href)
+        console.log(logpre(), '脚本已加载 @', location.href)
         buildUI()
         buildSurveyPanel()
         window.addEventListener('hashchange', applyRouteVisibility)
