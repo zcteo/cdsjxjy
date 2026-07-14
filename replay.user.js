@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         成都市中小学教师继续教育网-线下培训助手
 // @namespace    https://github.com/zcteo
-// @version      1.2.0
+// @version      1.3.0
 // @description  课程自动回放，观看记录页面自动完成问卷
 // @author       zcteo.cn@gmail.com
 // @license      AGPL-3.0-only
@@ -18,15 +18,15 @@
 // 仅供学习使用，作者不对该脚本产生的任何行为负责，严谨倒卖！！！
 // 尊重作者权益，请勿在未经允许的情况下擅自修改代码和发布到其他平台！
 // 仅支持 ad1a2087-a431-422f-a6cc-e28a8cb0dde8 问卷！
-// 更新日期：2026-07-12
+// 更新日期：2026-07-14
 // ****************************************************************************************
 
 ; (function () {
     'use strict'
     const COURSE_LEVEL_ID = '7CE980E9-FDC1-45DC-9033-D9D12E7EA432' // 全学段
-    const RENDER_INTERVAL = 2000 // 主面板刷新 + 窗口监控
     const KEEPALIVE_INTERVAL = 600000 // 10min，定时请求列表接口防止 token 失效
-    const WORKER_PROBE_INTERVAL = 2000 // 播放窗口探测播放按钮（兼计时步长）
+    const WORKER_PROBE_INTERVAL = 2000 // 播放窗口探测播放按钮（兼计时步长）；主面板刷新 + 窗口监控同频
+    const STALL_MS = 60000 // 已起播窗口超过 60s 未推进 watchedSec，判定 worker 卡死，关窗重开
 
     // 问卷答案库：key 为 queId，value 为固定的 recordList（提交时仅 projectId 改为对应 classId）
     // 新增其他问卷时，按同样结构追加一条即可
@@ -116,8 +116,8 @@
     }
 
     // ---------- 本地进度（GM 跨域共享）----------
-    // progress[classId] = { className, recordid, watchedSec, targetSec, finishedAt }
-    // finishedAt：本地刷满时的时间戳（毫秒，仅刷满时写入），用于 2 天安全阀
+    // progress[classId] = { className, recordid, watchedSec, targetSec, watchedAt }
+    // watchedAt：最后一次推进 watchedSec 的时间戳（毫秒，worker 每次累加时写入），用于 2 天安全阀
     const PROGRESS_KEY = 'cdsjxjy_progress'
     const STALE_MS = 2 * 86400000 // 本地刷满但服务端仍未确认，超过 2 天判定刷课失败、重刷
 
@@ -201,6 +201,7 @@
                 const d = p[e.classId]
                 if (d && d.watchedSec < d.targetSec) {
                     d.watchedSec = (d.watchedSec || 0) + WORKER_PROBE_INTERVAL / 1000
+                    d.watchedAt = Date.now()
                     p[e.classId] = d
                     saveProgress(p)
                 }
@@ -334,7 +335,7 @@
     let panel, tbody, statusEl
     const courses = [] // 显示用：{classId, className, status, watchedSec, targetSec, recordid, url, error, note}
     const queue = [] // 待开窗课程
-    const active = [] // {win, classId, openTs}
+    const active = [] // {win, classId, startWatchedSec, started}
 
     function buildUI() {
         panel = document.createElement('div')
@@ -671,7 +672,7 @@
         panel.querySelector('#ph_stop').disabled = false
         panel.querySelector('#ph_clear').disabled = true
 
-        renderTimer = setInterval(render, RENDER_INTERVAL)
+        renderTimer = setInterval(render, WORKER_PROBE_INTERVAL)
         keepaliveTimer = setInterval(() => {
             fetchPlaybackList(1, 1)
                 .then(() => console.log(logpre(), 'token 保活请求成功'))
@@ -725,7 +726,7 @@
                     //   距刷满 < 2 天 → 跳过（等服务端刷新，不重复刷）
                     //   距刷满 ≥ 2 天 → 服务端仍未认，判定刷课失败，重刷
                     if (ex && (ex.watchedSec || 0) >= ex.targetSec) {
-                        const age = Date.now() - (ex.finishedAt || 0)
+                        const age = Date.now() - (ex.watchedAt || 0)
                         if (age < STALE_MS) {
                             c.status = 'skipped'
                             c.note = '本地已刷满，待服务端刷新'
@@ -763,7 +764,7 @@
             }
             setStatus('开始刷课…')
             pump()
-            monitorTimer = setInterval(monitorTick, RENDER_INTERVAL)
+            monitorTimer = setInterval(monitorTick, WORKER_PROBE_INTERVAL)
         } catch (e) {
             setStatus('出错：' + ((e && e.message) || e))
             finishRun()
@@ -798,7 +799,6 @@
             active.push({
                 win,
                 classId: c.classId,
-                openTs: Date.now(),
                 startWatchedSec: c.watchedSec || 0, // 起播判定基线
                 started: false, // watchedSec 增长后置 true
             })
@@ -809,7 +809,7 @@
         }
     }
 
-    // 每 RENDER_INTERVAL：读 watchedSec 判起播/到点关窗；窗口提前关闭则标记错误；空位则 pump
+    // 每 WORKER_PROBE_INTERVAL：读 watchedSec 判起播/到点关窗；窗口提前关闭则标记错误；空位则 pump
     function monitorTick() {
         if (stopped) return
         const p = getProgress()
@@ -832,6 +832,23 @@
                 closed = true
             }
 
+            // 卡死检测：窗口仍开着、已起播、但 watchedAt 超过 STALL_MS 未推进 → worker 卡死
+            // 关窗并放回队列头重开（用户手动关窗时 closed 已为 true，不会走到这里）
+            if (!closed && a.started && c.watchedSec < c.targetSec) {
+                const stalledFor = Date.now() - ((entry && entry.watchedAt) || Date.now())
+                if (stalledFor > STALL_MS) {
+                    try {
+                        a.win.close()
+                    } catch (e) { }
+                    active.splice(i, 1)
+                    c.status = 'pending'
+                    queue.unshift(c)
+                    console.log(logpre(), 'worker 卡死超', STALL_MS / 1000, 's，关窗重开:', c.className)
+                    render()
+                    continue
+                }
+            }
+
             // 到目标时长 → 主窗口关窗（跨域允许 close 自己 open 的窗）
             if (!closed && c.watchedSec >= c.targetSec) {
                 try {
@@ -839,12 +856,6 @@
                 } catch (e) { }
                 closed = true
                 c.status = 'done'
-                // 由主窗口写 finishedAt：关窗与 worker 写入存在竞态，主窗口写更可靠
-                const entryDone = p[a.classId]
-                if (entryDone) {
-                    entryDone.finishedAt = Date.now()
-                    saveProgress(p)
-                }
                 console.log(logpre(), '达到目标时长，已关闭窗口:', c.className, c.watchedSec, '>=', c.targetSec)
             }
 
