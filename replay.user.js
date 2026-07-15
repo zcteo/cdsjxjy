@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         成都市中小学教师继续教育网-线下培训助手
 // @namespace    https://github.com/zcteo
-// @version      1.3.0
+// @version      1.3.1
 // @description  课程自动回放，观看记录页面自动完成问卷
 // @author       zcteo.cn@gmail.com
 // @license      AGPL-3.0-only
@@ -18,7 +18,7 @@
 // 仅供学习使用，作者不对该脚本产生的任何行为负责，严谨倒卖！！！
 // 尊重作者权益，请勿在未经允许的情况下擅自修改代码和发布到其他平台！
 // 仅支持 ad1a2087-a431-422f-a6cc-e28a8cb0dde8 问卷！
-// 更新日期：2026-07-14
+// 更新日期：2026-07-15
 // ****************************************************************************************
 
 ; (function () {
@@ -126,6 +126,15 @@
     }
     function saveProgress(p) {
         GM_setValue(PROGRESS_KEY, p)
+    }
+
+    // ---------- 面板设置持久化（刷课门数、同时窗口数）----------
+    const SETTINGS_KEY = 'cdsjxjy_settings'
+    function getSettings() {
+        return GM_getValue(SETTINGS_KEY, {}) || {}
+    }
+    function saveSettings(s) {
+        GM_setValue(SETTINGS_KEY, Object.assign(getSettings(), s))
     }
     // 按 recordid 反查 classId（播放窗口只知 recordid）
     function findClassIdByRecordid(progress, recordid) {
@@ -369,6 +378,11 @@
         document.body.appendChild(panel)
         tbody = panel.querySelector('#ph_tbody')
         statusEl = panel.querySelector('#ph_status')
+
+        // 恢复上次保存的刷课门数、同时窗口数
+        const savedSettings = getSettings()
+        if (savedSettings.count != null) panel.querySelector('#ph_count').value = savedSettings.count
+        if (savedSettings.conc != null) panel.querySelector('#ph_conc').value = savedSettings.conc
 
         panel.querySelector('#ph_close').onclick = () => {
             panelClosedHash = location.hash
@@ -666,6 +680,7 @@
             alert('请填写刷课门数')
             return
         }
+        saveSettings({ count: totalCount, conc: concurrency })
 
         started = true
         panel.querySelector('#ph_start').disabled = true
